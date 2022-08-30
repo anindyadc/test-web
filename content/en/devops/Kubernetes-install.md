@@ -40,166 +40,255 @@ sudo apt -y full-upgrade
 
    ```Shell
    $ kubectl version --client && kubeadm version
-   Client Version: version.Info{Major:"1", Minor:"24", GitVersion:"v1.24.3", GitCommit:"aef86a93758dc3cb2c658dd9657ab4ad4afc21cb", GitTreeState:"clean", BuildDate:"2022-07-13T14:30:46Z", GoVersion:"go1.18.3", Compiler:"gc", Platform:"linux/amd64"}
-
-   Kustomize Version: v4.5.4
-   kubeadm version: &version.Info{Major:"1", Minor:"24", GitVersion:"v1.24.3", GitCommit:"aef86a93758dc3cb2c658dd9657ab4ad4afc21cb", GitTreeState:"clean", BuildDate:"2022-07-13T14:29:09Z", GoVersion:"go1.18.3", Compiler:"gc", Platform:"linux/amd64"}
+   WARNING: This version information is deprecated and will be replaced with the output from kubectl version --short.  Use --output=yaml|json to get the full version.
+   Client Version: version.Info{Major:"1", Minor:"25", GitVersion:"v1.25.0", GitCommit:"a866cbe2e5bbaa01cfd5e969aa3e033f3282a8a2", GitTreeState:"clean", BuildDate:"2022-08-23T17:44:59Z", GoVersion:"go1.19", Compiler:"gc", Platform:"linux/amd64"}
+   Kustomize Version: v4.5.7
+   kubeadm version: &version.Info{Major:"1", Minor:"25", GitVersion:"v1.25.0", GitCommit:"a866cbe2e5bbaa01cfd5e969aa3e033f3282a8a2", GitTreeState:"clean", BuildDate:"2022-08-23T17:43:25Z", GoVersion:"go1.19", Compiler:"gc", Platform:"linux/amd64"}
+   ```
+4. Disable Swap Space
+   ```Shell
+   sudo swapoff -a 
+   ```
+5. Check if swap has been disabled by running the free command.
+   ```Shell
+   $ free -h
+                  total        used        free      shared  buff/cache   available
+   Mem:           966Mi       189Mi       127Mi       0.0Ki       649Mi       615Mi
+   Swap:             0B          0B          0B
+   ```
+6. Enable kernel modules 
+   ```Shell
+   sudo modprobe overlay
+   sudo modprobe br_netfilter
+   ```
+7. Add settings to sysctl
+   ```Shell
+   sudo tee /etc/sysctl.d/kubernetes.conf<<EOF
+   net.bridge.bridge-nf-call-ip6tables = 1
+   net.bridge.bridge-nf-call-iptables = 1
+   net.ipv4.ip_forward = 1
+   EOF
+   ```
+8. Reload sysctl
+   ```Shell
+   sudo sysctl --system
    ```
 
-3. Install the Geekdoc theme from a [release bundle](#option-1-download-pre-build-release-bundle) (recommended) or from [Git branch](#option-2-clone-the-github-repository).
+## Install Container runtime (Master and Worker nodes) ##
 
-4. Create the minimal required Hugo configuration `config.toml`. For all configuration options take a look at the [configuration](/usage/configuration/) page.
+To run containers in Pods, Kubernetes uses a **container runtime**. Supported container runtimes are:
 
-   ```Toml
-   baseURL = "http://localhost"
-   title = "Geekdocs"
-   theme = "hugo-geekdoc"
+- Docker
+- CRI-O
+- Containerd
 
-   pluralizeListTitles = false
+{{< hint type=note >}}
+**Info**\
+**Dockershim** has been removed from the Kubernetes project as of release 1.24.
+You need to install a container runtime into each node in the cluster so that Pods can run there. 
+Kubernetes 1.25 requires that you use a runtime that conforms with the Container Runtime Interface (CRI).
+{{< /hint >}}
 
-   # Geekdoc required configuration
-   pygmentsUseClasses = true
-   pygmentsCodeFences = true
-   disablePathToLower = true
-
-   # Required if you want to render robots.txt template
-   enableRobotsTXT = true
-
-   # Needed for mermaid shortcodes
-   [markup]
-     [markup.goldmark.renderer]
-       # Needed for mermaid shortcode
-       unsafe = true
-     [markup.tableOfContents]
-       startLevel = 1
-       endLevel = 9
-
-   [taxonomies]
-      tag = "tags"
-   ```
-
-5. Test your site.
+### Install Docker runtime ###
 
    ```Shell
-   hugo server -D
+   # Add repo and Install packages
+   sudo apt update
+   sudo apt install -y curl gnupg2 software-properties-common apt-transport-https ca-certificates
+   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+   sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+   sudo apt update
+   sudo apt install -y containerd.io docker-ce docker-ce-cli
+
+   # Create required directories
+   sudo mkdir -p /etc/systemd/system/docker.service.d
+   # Create daemon json config file
+   sudo tee /etc/docker/daemon.json <<EOF
+   {
+      "exec-opts": ["native.cgroupdriver=systemd"],
+      "log-driver": "json-file",
+      "log-opts": {
+      "max-size": "100m"
+   },
+      "storage-driver": "overlay2"
+   }
+   EOF
+
+   # Start and enable Services
+   sudo systemctl daemon-reload 
+   sudo systemctl restart docker
+   sudo systemctl enable docker
+
+   # Configure persistent loading of modules
+   sudo tee /etc/modules-load.d/k8s.conf <<EOF
+   overlay
+   br_netfilter
+   EOF
+
+   # Ensure you load modules
+   sudo modprobe overlay
+   sudo modprobe br_netfilter
+
+   # Set up required sysctl params
+   sudo tee /etc/sysctl.d/kubernetes.conf<<EOF
+   net.bridge.bridge-nf-call-ip6tables = 1
+   net.bridge.bridge-nf-call-iptables = 1
+   net.ipv4.ip_forward = 1
+   EOF
    ```
 
-### Option 1: Download pre-build release bundle
+{{< hint type=note >}}
+We proceed with the container runtime as **Docker CE**.
+{{< /hint >}}
 
-Download and extract the latest release bundle into the theme directory.
+### Install Mirantis cri-dockerd as Docker Engine shim for Kubernetes ###
 
-```Shell
-mkdir -p themes/hugo-geekdoc/
-curl -L https://github.com/thegeeklab/hugo-geekdoc/releases/latest/download/hugo-geekdoc.tar.gz | tar -xz -C themes/hugo-geekdoc/ --strip-components=1
-```
+1. Prepare to update
+   ```Shell
+   sudo apt update
+   sudo apt install git wget curl
+   # get the latest release version
+   VER=$(curl -s https://api.github.com/repos/Mirantis/cri-dockerd/releases/latest|grep tag_name | cut -d '"' -f 4|sed 's/v//g')
+   echo $VER
+   ```
+2. Download the archive file from Github cri-dockerd releases page
+   ```Shell
+   wget https://github.com/Mirantis/cri-dockerd/releases/download/v${VER}/cri-dockerd-${VER}.amd64.tgz
+   tar xvf cri-dockerd-${VER}.amd64.tgz
+   sudo mv cri-dockerd/cri-dockerd /usr/local/bin/
+   # Validate 
+   cri-dockerd --version
+   ```
+3. Configure systemd units for cri-dockerd:
+   ```Shell
+   wget https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.service
+   wget https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.socket
+   sudo mv cri-docker.socket cri-docker.service /etc/systemd/system/
+   sudo sed -i -e 's,/usr/bin/cri-dockerd,/usr/local/bin/cri-dockerd,' /etc/systemd/system/cri-docker.service
+   
+4. Start and enable the services
+   ```Shell
+   sudo systemctl daemon-reload
+   sudo systemctl enable cri-docker.service
+   sudo systemctl enable --now cri-docker.socket
+   ```
 
-### Option 2: Clone the GitHub repository
+5. Confirm the service is now running:
+   
+   ```Shell
+   $ systemctl status cri-docker.socket
+   ```
+6. Configure the kubelet to use cri-dockerd
+   ```Shell
+   sudo kubeadm config images pull --cri-socket /run/cri-dockerd.sock 
+   ```
+## Bootstrap Control plane (This is for single node controller) ##
+1. Initialise kubernetes cluster.
+   ```Shell
+      sudo kubeadm init \
+            --pod-network-cidr=10.244.0.0/16 \
+            --cri-socket /run/cri-dockerd.sock \
+            --ignore-preflight-errors=NumCPU,Mem
+   ```
+2. To start using your cluster, you need to run the following as a regular user:
+   ```Shell
+   mkdir -p $HOME/.kube
+   sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+   sudo chown $(id -u):$(id -g) $HOME/.kube/config
+   ```
+3. Check Kubernetes cluster status.
+   ```Shell
+   $ kubectl get nodes
+   NAME              STATUS     ROLES           AGE    VERSION
+   ip-172-31-30-23   NotReady   control-plane   2m1s   v1.25.0
+   ```
+4. Initialize control plane (run on first master node)
+   ```Shell
+   lsmod | grep br_netfilter
+   sudo systemctl enable kubelet
+   ```
+5. Check cluster info.
+   ```Shell
+   $ kubectl cluster-info
+   Kubernetes control plane is running at https://172.31.30.23:6443
+   CoreDNS is running at https://172.31.30.23:6443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
 
+   To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.
+   ```
+
+## Install Kubernetes network plugin ##
+1. Download flannel config file.
+
+   ```Shell
+   wget https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+   ```
+2. Verify below section in the file and ensure it matches ip range mentioned above.
+
+   ```Shell
+   .......
+   .......
+   net-conf.json: |
+      {
+         "Network": "10.244.0.0/16",
+         "Backend": {
+         "Type": "vxlan"
+      }
+   .......
+   .......
+   ```
+3. Check kube flannel status.
+   ```Shell
+   $ kubectl get pods -n kube-flannel
+   NAME                    READY   STATUS    RESTARTS   AGE
+   kube-flannel-ds-zqqqx   1/1     Running   0          92s
+   ```
+4. Verify ip range.
+   ```Shell
+   $ ip r
+   default via 172.31.16.1 dev eth0 proto dhcp src 172.31.30.23 metric 100 
+   10.244.0.0/24 dev cni0 proto kernel scope link src 10.244.0.1 
+   172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown 
+   172.31.0.2 via 172.31.16.1 dev eth0 proto dhcp src 172.31.30.23 metric 100 
+   172.31.16.0/20 dev eth0 proto kernel scope link src 172.31.30.23 metric 100 
+   172.31.16.1 dev eth0 proto dhcp scope link src 172.31.30.23 metric 100 
+   ```
+5. Now the cluster will be ready to serve.
+   ```Shell
+   $ kubectl get nodes
+   NAME              STATUS   ROLES           AGE   VERSION
+   ip-172-31-30-23   Ready    control-plane   14m   v1.25.0
+   ```
+6. Get the cluster details to check.
+   ```Shell
+   $ kubectl get nodes -o wide
+   NAME              STATUS   ROLES           AGE   VERSION   INTERNAL-IP    EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION    CONTAINER-RUNTIME
+   ip-172-31-30-23   Ready    control-plane   13m   v1.25.0   172.31.30.23   <none>        Ubuntu 22.04.1 LTS   5.15.0-1017-aws   docker://20.10.17
+   ```
+
+## Add worker nodes to the k8 cluster ##
+1. Run below command on the master/control plane node.
+   ```Shell
+   kubeadm token create --print-join-command
+   ```
+   Output
+   ```Shell
+   kubeadm join 172.31.30.23:6443 --token 4lw1ho.uycbcyuw08rma2kb --discovery-token-ca-cert-hash sha256:3952b82c082f32b38a487cf26a99698223540fad81e8fc99e57e6fb28d35d3c9 
+   ```
+2. Run the above command in output within worker node. Now the cluster will show as below.
+   ```Shell
+   $ kubectl get nodes
+   NAME              STATUS   ROLES           AGE     VERSION
+   ip-172-31-28-98   Ready    <none>          22s     v1.25.0
+   ip-172-31-30-23   Ready    control-plane   4h26m   v1.25.0
+   ```    
+
+<!--
 {{< hint type=note >}}
 **Info**\
 Keep in mind this method is not recommended and needs some extra steps to get it working.
 If you want to use the Theme as submodule keep in mind that your build process need to
 run the described steps as well.
 {{< /hint >}}
+-->
 
-Clone the Geekdoc git repository.
 
-```Shell
-git clone https://github.com/thegeeklab/hugo-geekdoc.git themes/hugo-geekdoc
-```
-
-Build required theme assets e.g. CSS files and SVG sprites.
-
-```Shell
-npm install
-npm run build
-```
-
-## Deployments
-
-### Netlify
-
-There are several ways to deploy your site with this theme on Netlify. Regardless of which solution you choose, the main goal is to ensure that the prebuilt theme release tarball is used or to run the [required commands](#option-2-clone-the-github-repository) to prepare the theme assets before running the Hugo build command.
-
-Here are some possible solutions:
-
-**Use a Makefile:**
-
-Add a Makefile to your repository to bundle the required steps.
-
-```Makefile
-THEME_VERSION := v0.8.2
-THEME := hugo-geekdoc
-BASEDIR := docs
-THEMEDIR := $(BASEDIR)/themes
-
-.PHONY: doc
-doc: doc-assets doc-build
-
-.PHONY: doc-assets
-doc-assets:
-   mkdir -p $(THEMEDIR)/$(THEME)/ ; \
-   curl -sSL "https://github.com/thegeeklab/$(THEME)/releases/download/${THEME_VERSION}/$(THEME).tar.gz" | tar -xz -C $(THEMEDIR)/$(THEME)/ --strip-components=1
-
-.PHONY: doc-build
-doc-build:
-        cd $(BASEDIR); hugo
-
-.PHONY: clean
-clean:
-   rm -rf $(THEMEDIR) && \
-   rm -rf $(BASEDIR)/public
-```
-
-This Makefile can be used in your `netlify.toml`, take a look at the Netlify [example](https://docs.netlify.com/configure-builds/file-based-configuration/#sample-netlify-toml-file) for more information:
-
-```toml
-[build]
-publish = "docs/public"
-command = "make doc"
-```
-
-**Chain required commands:**
-
-Chain all required commands to prepare the theme and build your site on the `command` option in your `netlify.toml` like this:
-
-```toml
-[build]
-publish = "docs/public"
-command = "command1 && command 2 && command3 && hugo"
-```
-
-### Subdirectories
-
-{{< hint type=important >}}
-**Warning**\
-As deploying Hugo sites on subdirectories is not as robust as on subdomains, we do not recommend this.
-If you have a choice, using a domain/subdomain should always be the preferred solution!
-{{< /hint >}}
-
-If you want to deploy your site to a subdirectory of your domain, some extra steps are required:
-
-- Configure your Hugo base URL e.g. `baseURL = http://localhost/demo/`.
-- Don't use `relativeURLs: false` nor `canonifyURLs: true` as is can cause unwanted side effects!
-
-There are two ways to get Markdown links or images working:
-
-- Use the absolute path including your subdirectory e.g. `[testlink](/demo/example-site)`
-- Overwrite the HTML base in your site configuration with `geekdocOverwriteHTMLBase = true` and use the relative path e.g. `[testlink](example-site)`
-
-But there is another special case if you use `geekdocOverwriteHTMLBase = true`. If you use anchors in your Markdown links you have to ensure to always include the page path. As an example `[testlink](#some-anchor)` will resolve to `http://localhost/demo/#some-anchor` and not automatically include the current page!
-
-## Known Limitations
-
-### Minify HTML results in spacing issues
-
-Using `hugo --minify` without further configuration or using other minify tools that also minify HTML files might result in spacing issues in the theme and is **not** supported.
-
-After some testing we decided to not spend effort to fix this issue for now as the benefit is very low. There are some parts of the theme where spaces between HTML elements matters but were stripped by minify tools. Some of these issues are related to <!-- spellchecker-disable -->[gohugoio/hugo#6892](https://github.com/gohugoio/hugo/issues/6892).<!-- spellchecker-enable --> While recommendation like "don't depend on whitespace in your layout" sounds reasonable, it seems to be not that straight forward especially for something like embedded icons into the text flow.
-
-If you still want to use Hugo's minify flag you should at least exclude HTML file in your site [configuration](https://gohugo.io/getting-started/configuration/#configure-minify):
-
-```toml
-[minify]
-  disableHTML = true
-```
